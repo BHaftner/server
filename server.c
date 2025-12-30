@@ -6,15 +6,44 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <sys/wait.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
 
 #define PORT "3490"  // the port users will be connecting to
 #define BACKLOG 10   // how many pending connections queue will hold
+#define BUFFER_SIZE 65536
+
+// get content-type
+const char *get_mime_type(const char *filename) {
+
+	const char *dot = strrchr(filename, '.');
+	if (!dot) return "text/plain";
+	if (strcmp(dot, ".html") == 0) return "text/html";
+	if (strcmp(dot, ".css") == 0) return "text/css";
+	if (strcmp(dot, ".js") == 0) return "application/javascript";
+	if (strcmp(dot, ".jpg") == 0) return "image/jpeg";
+	if (strcmp(dot, ".png") == 0) return "image/png";
+	if (strcmp(dot, ".gif") == 0) return "image/gif";
+	return "text/plain";
+}
+
+// 404 response
+void send_404(int client_fd) {
+
+	const char *response = "HTTP/1.1 404 NOT FOUND\r\n"
+						   "Content-Type: text/plain\r\n"
+						   "Content-Length: 13\r\n"
+						   "\r\n"
+						   "404 Not Found";
+
+	send(client_fd, response, strlen(response), 0);
+}
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -29,49 +58,58 @@ void *get_in_addr(struct sockaddr *sa)
 void *handle_client(void *arg) {
 
 	int client_fd = (int)(intptr_t)arg;
-
-	char buffer[4096];
+	char buffer[BUFFER_SIZE];
+	
 	ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
-	if (bytes_received < 0) {
+	if (bytes_received <= 0) {
 		perror("recv");
 		close(client_fd);
 		return NULL;
-	} else if (bytes_received == 0) {
+	}	
+	buffer[bytes_received] = '\0';
+
+	char method[16], uri[256], protocol[16];
+
+	sscanf(buffer, "%15s %255s %15s", method, uri, protocol);
+	printf("Request: %s %s\n", method, uri);
+
+	char filepath[512];
+	if (strcmp(uri, "/") == 0) {
+		sprintf(filepath, "www/index.html");
+	} else {
+		sprintf(filepath, "www%s", uri);
+	}
+
+	FILE *file = fopen(filepath, "rb");
+	if (!file) {
+		perror("404 Not Found");
+		send_404(client_fd);
 		close(client_fd);
 		return NULL;
 	}
 
-	buffer[bytes_received] = '\0';
+	fseek(file, 0, SEEK_END);
+	long file_size = ftell(file);
+	fseek(file, 0, SEEK_SET);
 
-	char method[16];
-	char uri[256];
-	char protocol[16];
+	const char *mime_type = get_mime_type(filepath);
 
-	sscanf(buffer, "%15s %255s %15s", method, uri, protocol);
-	printf("Thread %lu received: %s %s\n", (unsigned long)pthread_self(), method, uri);
-
-	char *msg = "HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/html\r\n"
-		"Content-Length: 20\r\n"
-		"\r\n"
-		"<h1>Hello World</h1>";
-
-	// send loop incase OS buffer is full
+	char header[1024];
+	int header_len = snprintf(header, sizeof(header),
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: %s\r\n"
+			"Content-Length: %ld\r\n"
+			"\r\n",
+			mime_type, file_size);
+	send(client_fd, header, header_len, 0);
 	
-	size_t total_len = strlen(msg);
-	size_t sent_len = 0;
-	
-	while (sent_len < total_len) {
-	
-		ssize_t s = send(client_fd, msg + sent_len, total_len - sent_len, 0);
-		if (s == -1) {
-			perror("send");
-			break;
-		}
-		sent_len += s;
+	size_t bytes_read;
+	while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+		send(client_fd, buffer, bytes_read, 0);
 	}
-
+	
+	fclose(file);
 	close(client_fd);
 	return NULL;
 }
@@ -137,6 +175,7 @@ int main(void) {
 	printf("server: waiting for connections...\n");
 
 	while(1) {  // main accept() loop
+		
 		sin_size = sizeof their_addr;
 		new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
 		if (new_fd == -1) {
