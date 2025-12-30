@@ -7,12 +7,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-
 
 #define PORT "3490"
 #define MAX_EVENTS 10
@@ -106,17 +106,23 @@ void handle_client(int client_fd, int epoll_fd) {
 		sprintf(filepath, "www%s", uri);
 	}
 
-	FILE *file = fopen(filepath, "rb");
-	if (!file) {
+	int file_fd = open(filepath, O_RDONLY);
+	if (file_fd < 0) {
 		send_404(client_fd);
 		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 		close(client_fd);
 		return;
 	}
 
-	fseek(file, 0, SEEK_END);
-	long file_size = ftell(file);
-	fseek(file, 0, SEEK_SET);
+	struct stat file_stat;
+	if (fstat(file_fd, &file_stat) < 0) {
+		perror("fstat");
+		close(file_fd);
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+		close(client_fd);
+		return;
+	}
+	off_t file_size = file_stat.st_size;
 
 	const char *mime_type = get_mime_type(filepath);
 	char header[1024];
@@ -133,7 +139,7 @@ void handle_client(int client_fd, int epoll_fd) {
 
 	while (offset < file_size) {
 
-		ssize_t res = sendfile(client_fd, fileno(file), &offset, file_size - offset);
+		ssize_t res = sendfile(client_fd, file_fd, &offset, file_size - offset);
 
 		if (res < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -143,7 +149,7 @@ void handle_client(int client_fd, int epoll_fd) {
 		sent_bytes += res;
 	}
 	
-	fclose(file);
+	close(file_fd);
 	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 	close(client_fd);
 }
