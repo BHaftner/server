@@ -10,22 +10,10 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <pthread.h>
 
 #define PORT "3490"  // the port users will be connecting to
 #define BACKLOG 10   // how many pending connections queue will hold
-
-void sigchld_handler(int s)
-{
-	(void)s; // quiet unused variable warning
-
-	// waitpid() might overwrite errno, so we save and restore it:
-	int saved_errno = errno;
-
-	while(waitpid(-1, NULL, WNOHANG) > 0);
-
-	errno = saved_errno;
-}
-
 
 // get sockaddr, IPv4 or IPv6:
 void *get_in_addr(struct sockaddr *sa)
@@ -37,6 +25,31 @@ void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+void *handle_client(void *arg) {
+
+	// cast the void pointer back to an int pointer
+	int *sockfd_ptr = (int *)arg;
+	int new_fd = *sockfd_ptr;
+
+	// free memory allocated in the main loop
+	free(sockfd_ptr);
+
+	char *msg = "HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html\r\n"
+		"Content-Length: 20\r\n"
+		"\r\n"
+		"<h1>Hello World</h1>";
+
+	if (send(new_fd, msg, strlen(msg), 0) == -1) {
+		perror("send");
+	}
+
+	// close socket
+	close(new_fd);
+
+	pthread_exit(NULL);
+}
+
 int main(void)
 {
 	// listen on sock_fd, new connection on new_fd
@@ -44,7 +57,6 @@ int main(void)
 	struct addrinfo hints, *servinfo, *p;
 	struct sockaddr_storage their_addr; // connector's address info
 	socklen_t sin_size;
-	struct sigaction sa;
 	int yes=1;
 	char s[INET6_ADDRSTRLEN];
 	int rv;
@@ -94,46 +106,38 @@ int main(void)
 		exit(1);
 	}
 
-	sa.sa_handler = sigchld_handler; // reap all dead processes
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-		perror("sigaction");
-		exit(1);
-	}
-
 	printf("server: waiting for connections...\n");
 
 	while(1) {  // main accept() loop
 		sin_size = sizeof their_addr;
-		new_fd = accept(sockfd, (struct sockaddr *)&their_addr,
-				&sin_size);
+		new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
 		if (new_fd == -1) {
 			perror("accept");
 			continue;
 		}
 
 		inet_ntop(their_addr.ss_family,
-			get_in_addr((struct sockaddr *)&their_addr),
-			s, sizeof s);
+			get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
 		printf("server: got connection from %s\n", s);
 
-		char *msg = "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: 20\r\n"
-            "\r\n"
-            "<h1>Hello World</h1>";
-		send(new_fd, msg, strlen(msg), 0);
-
-		if (!fork()) { // this is the child process
-			close(sockfd); // child doesn't need the listener
-			if (send(new_fd, "Hello, world!", 13, 0) == -1)
-				perror("send");
+		int *client_sock = malloc(sizeof(int));
+		if (client_sock == NULL) {
+			perror("malloc");
 			close(new_fd);
-			exit(0);
+			continue;
 		}
-		close(new_fd);  // parent doesn't need this
-	}
+		*client_sock = new_fd;
 
+		// create the thread
+		pthread_t thread_id;
+		if (pthread_create(&thread_id, NULL, handle_client, (void*)client_sock) != 0) {
+			perror("pthred_create");
+			free(client_sock);
+			close(new_fd);
+			continue;
+		}
+
+		pthread_detach(thread_id);
+	}
 	return 0;
 }
