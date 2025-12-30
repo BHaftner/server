@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
@@ -27,12 +28,28 @@ void *get_in_addr(struct sockaddr *sa)
 
 void *handle_client(void *arg) {
 
-	// cast the void pointer back to an int pointer
-	int *sockfd_ptr = (int *)arg;
-	int new_fd = *sockfd_ptr;
+	int client_fd = (int)(intptr_t)arg;
 
-	// free memory allocated in the main loop
-	free(sockfd_ptr);
+	char buffer[4096];
+	ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+	if (bytes_received < 0) {
+		perror("recv");
+		close(client_fd);
+		return NULL;
+	} else if (bytes_received == 0) {
+		close(client_fd);
+		return NULL;
+	}
+
+	buffer[bytes_received] = '\0';
+
+	char method[16];
+	char uri[256];
+	char protocol[16];
+
+	sscanf(buffer, "%s %s %s", method, uri, protocol);
+	printf("Thread %lu received: %s %s\n", (unsigned long)pthread_self(), method, uri);
 
 	char *msg = "HTTP/1.1 200 OK\r\n"
 		"Content-Type: text/html\r\n"
@@ -40,18 +57,14 @@ void *handle_client(void *arg) {
 		"\r\n"
 		"<h1>Hello World</h1>";
 
-	if (send(new_fd, msg, strlen(msg), 0) == -1) {
-		perror("send");
-	}
+	send(client_fd, msg, strlen(msg), 0);
 
-	// close socket
-	close(new_fd);
-
-	pthread_exit(NULL);
+	close(client_fd);
+	return NULL;
 }
 
-int main(void)
-{
+int main(void) {
+
 	// listen on sock_fd, new connection on new_fd
 	int sockfd, new_fd;
 	struct addrinfo hints, *servinfo, *p;
@@ -120,19 +133,10 @@ int main(void)
 			get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
 		printf("server: got connection from %s\n", s);
 
-		int *client_sock = malloc(sizeof(int));
-		if (client_sock == NULL) {
-			perror("malloc");
-			close(new_fd);
-			continue;
-		}
-		*client_sock = new_fd;
-
 		// create the thread
 		pthread_t thread_id;
-		if (pthread_create(&thread_id, NULL, handle_client, (void*)client_sock) != 0) {
+		if (pthread_create(&thread_id, NULL, handle_client, (void*)(intptr_t)new_fd) != 0) {
 			perror("pthred_create");
-			free(client_sock);
 			close(new_fd);
 			continue;
 		}
