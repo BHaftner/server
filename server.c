@@ -48,7 +48,7 @@ void *handle_client(void *arg) {
 	char uri[256];
 	char protocol[16];
 
-	sscanf(buffer, "%s %s %s", method, uri, protocol);
+	sscanf(buffer, "%15s %255s %15s", method, uri, protocol);
 	printf("Thread %lu received: %s %s\n", (unsigned long)pthread_self(), method, uri);
 
 	char *msg = "HTTP/1.1 200 OK\r\n"
@@ -57,7 +57,20 @@ void *handle_client(void *arg) {
 		"\r\n"
 		"<h1>Hello World</h1>";
 
-	send(client_fd, msg, strlen(msg), 0);
+	// send loop incase OS buffer is full
+	
+	size_t total_len = strlen(msg);
+	size_t sent_len = 0;
+	
+	while (sent_len < total_len) {
+	
+		ssize_t s = send(client_fd, msg + sent_len, total_len - sent_len, 0);
+		if (s == -1) {
+			perror("send");
+			break;
+		}
+		sent_len += s;
+	}
 
 	close(client_fd);
 	return NULL;
@@ -73,6 +86,8 @@ int main(void) {
 	int yes=1;
 	char s[INET6_ADDRSTRLEN];
 	int rv;
+
+	signal(SIGPIPE, SIG_IGN);
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_INET;
