@@ -1,23 +1,31 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <pthread.h>
 
-#define PORT "3490"  // the port users will be connecting to
-#define BACKLOG 10   // how many pending connections queue will hold
+
+#define PORT "3490"
+#define MAX_EVENTS 10
+#define BACKLOG 10
 #define BUFFER_SIZE 65536
+
+// makes a non-blocking socket
+int set_nonblocking(int sockfd) {
+
+	int flags = fcntl(sockfd, F_GETFL, 0);
+	if (flags == -1) return -1;
+	if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) return -1;
+	return 0;
+}
 
 // get content-type
 const char *get_mime_type(const char *filename) {
@@ -55,18 +63,25 @@ void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-void *handle_client(void *arg) {
+void handle_client(int client_fd) {
 
-	int client_fd = (int)(intptr_t)arg;
 	char buffer[BUFFER_SIZE];
 	
 	ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
-	if (bytes_received <= 0) {
-		perror("recv");
+	if (bytes_received < 0) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			perror("recv");
+			close(client_fd);
+		}
+		return;
+	}
+
+	if (bytes_received == 0) {
 		close(client_fd);
-		return NULL;
-	}	
+		return;
+	}
+
 	buffer[bytes_received] = '\0';
 
 	char method[16], uri[256], protocol[16];
@@ -83,10 +98,9 @@ void *handle_client(void *arg) {
 
 	FILE *file = fopen(filepath, "rb");
 	if (!file) {
-		perror("404 Not Found");
 		send_404(client_fd);
 		close(client_fd);
-		return NULL;
+		return;
 	}
 
 	fseek(file, 0, SEEK_END);
@@ -94,7 +108,6 @@ void *handle_client(void *arg) {
 	fseek(file, 0, SEEK_SET);
 
 	const char *mime_type = get_mime_type(filepath);
-
 	char header[1024];
 	int header_len = snprintf(header, sizeof(header),
 			"HTTP/1.1 200 OK\r\n"
@@ -111,18 +124,15 @@ void *handle_client(void *arg) {
 	
 	fclose(file);
 	close(client_fd);
-	return NULL;
 }
 
 int main(void) {
 
-	// listen on sock_fd, new connection on new_fd
-	int sockfd, new_fd;
+	int listen_fd, new_fd;
 	struct addrinfo hints, *servinfo, *p;
-	struct sockaddr_storage their_addr; // connector's address info
+	struct sockaddr_storage their_addr;
 	socklen_t sin_size;
 	int yes=1;
-	char s[INET6_ADDRSTRLEN];
 	int rv;
 
 	signal(SIGPIPE, SIG_IGN);
@@ -130,29 +140,33 @@ int main(void) {
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE; // use my IP
+	hints.ai_flags = AI_PASSIVE;
 
 	if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
 		return 1;
 	}
 
-	// loop through all the results and bind to the first we can
 	for(p = servinfo; p != NULL; p = p->ai_next) {
-		if ((sockfd = socket(p->ai_family, p->ai_socktype,
+		if ((listen_fd = socket(p->ai_family, p->ai_socktype,
 				p->ai_protocol)) == -1) {
 			perror("server: socket");
 			continue;
 		}
 
-		if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
+		if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes,
 				sizeof(int)) == -1) {
 			perror("setsockopt");
 			exit(1);
 		}
 
-		if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-			close(sockfd);
+		if (set_nonblocking(listen_fd) == -1) {
+			perror("set_nonblocking");
+			exit(1);
+		}
+
+		if (bind(listen_fd, p->ai_addr, p->ai_addrlen) == -1) {
+			close(listen_fd);
 			perror("server: bind");
 			continue;
 		}
@@ -160,42 +174,73 @@ int main(void) {
 		break;
 	}
 
-	freeaddrinfo(servinfo); // all done with this structure
+	freeaddrinfo(servinfo);
 
 	if (p == NULL)  {
 		fprintf(stderr, "server: failed to bind\n");
 		exit(1);
 	}
 
-	if (listen(sockfd, BACKLOG) == -1) {
+	if (listen(listen_fd, BACKLOG) == -1) {
 		perror("listen");
 		exit(1);
 	}
 
-	printf("server: waiting for connections...\n");
+	int epoll_fd = epoll_create1(0);
+	if (epoll_fd == -1) {
+		perror("epoll_create1");
+		exit(1);
+	}
+
+	struct epoll_event event;
+	struct epoll_event events[MAX_EVENTS];
+
+	event.data.fd = listen_fd;
+	event.events = EPOLLIN;
+
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) == -1) {
+		perror("epoll_ctl: listen_fd");
+		exit(1);
+	}
+
+	printf("server: waiting for connections (epoll mode)...\n");
 
 	while(1) {  // main accept() loop
 		
-		sin_size = sizeof their_addr;
-		new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
-		if (new_fd == -1) {
-			perror("accept");
-			continue;
+		int n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+
+		if (n_events == -1) {
+			perror("epoll_wait");
+			exit(1);
 		}
 
-		inet_ntop(their_addr.ss_family,
-			get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-		printf("server: got connection from %s\n", s);
+		for (int i = 0; i < n_events; i++) {
+		
+			if (events[i].data.fd == listen_fd) {
+				sin_size = sizeof their_addr;
+				new_fd = accept(listen_fd, (struct sockaddr *)&their_addr, &sin_size);
+				if (new_fd == -1) {
+					perror("accept");
+					continue;
+				}
 
-		// create the thread
-		pthread_t thread_id;
-		if (pthread_create(&thread_id, NULL, handle_client, (void*)(intptr_t)new_fd) != 0) {
-			perror("pthred_create");
-			close(new_fd);
-			continue;
-		}
+				if (set_nonblocking(new_fd) == -1) {
+					perror("set_nonblocking");
+					exit(1);
+				}
 
-		pthread_detach(thread_id);
+				event.data.fd = new_fd;
+				event.events = EPOLLIN;
+				if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
+                    perror("epoll_ctl: new_fd");
+                    exit(1);
+                }
+			} else {
+				handle_client(events[i].data.fd);
+			}
+		} 
 	}
+
+	close(listen_fd);
 	return 0;
 }
