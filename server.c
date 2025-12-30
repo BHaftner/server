@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/sendfile.h>
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -63,21 +64,22 @@ void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-void handle_client(int client_fd) {
+void handle_client(int client_fd, int epoll_fd) {
 
 	char buffer[BUFFER_SIZE];
-	
 	ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
 	if (bytes_received < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			perror("recv");
+			epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 			close(client_fd);
 		}
 		return;
 	}
 
 	if (bytes_received == 0) {
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 		close(client_fd);
 		return;
 	}
@@ -89,6 +91,14 @@ void handle_client(int client_fd) {
 	sscanf(buffer, "%15s %255s %15s", method, uri, protocol);
 	printf("Request: %s %s\n", method, uri);
 
+	// security check for directory traversal
+	if (strstr(uri, "..")) {
+		send_404(client_fd);
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+		close(client_fd);
+		return;
+	}
+
 	char filepath[512];
 	if (strcmp(uri, "/") == 0) {
 		sprintf(filepath, "www/index.html");
@@ -99,6 +109,7 @@ void handle_client(int client_fd) {
 	FILE *file = fopen(filepath, "rb");
 	if (!file) {
 		send_404(client_fd);
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 		close(client_fd);
 		return;
 	}
@@ -117,12 +128,23 @@ void handle_client(int client_fd) {
 			mime_type, file_size);
 	send(client_fd, header, header_len, 0);
 	
-	size_t bytes_read;
-	while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-		send(client_fd, buffer, bytes_read, 0);
+	off_t offset = 0;
+	ssize_t sent_bytes = 0;
+
+	while (offset < file_size) {
+
+		ssize_t res = sendfile(client_fd, fileno(file), &offset, file_size - offset);
+
+		if (res < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+			perror("sendfile");
+			break;
+		}
+		sent_bytes += res;
 	}
 	
 	fclose(file);
+	epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
 	close(client_fd);
 }
 
@@ -236,7 +258,7 @@ int main(void) {
                     exit(1);
                 }
 			} else {
-				handle_client(events[i].data.fd);
+				handle_client(events[i].data.fd, epoll_fd);
 			}
 		} 
 	}
