@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,6 +11,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/epoll.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -25,6 +28,10 @@
 #define HEADER_BUFFER_SIZE 1024
 #define CONNECTION_POOL_SIZE 10000
 #define CONNECTION_TIMEOUT 5
+
+#ifndef EPOLLEXCLUSIVE
+#define EPOLLEXCLUSIVE (1U << 28)
+#endif
 
 typedef enum {
     STATE_READ_REQUEST,
@@ -66,6 +73,7 @@ connection_t *free_list[CONNECTION_POOL_SIZE];
 int free_list_count = CONNECTION_POOL_SIZE;
 
 connection_t *active_connections = NULL;
+connection_t *active_connections_tail = NULL;
 
 char www_root_path[PATH_MAX];
 
@@ -83,6 +91,8 @@ void list_add(connection_t *conn) {
     conn->prev = NULL;
     if (active_connections) {
         active_connections->prev = conn;
+    } else {
+        active_connections_tail = conn;
     }
     active_connections = conn;
 }
@@ -96,10 +106,39 @@ void list_remove(connection_t *conn) {
     
     if (conn->next) {
         conn->next->prev = conn->prev;
+    } else {
+        active_connections_tail = conn->prev;
     }
     
     conn->next = NULL;
     conn->prev = NULL;
+}
+
+void list_move_to_tail(connection_t *conn) {
+    if (conn == active_connections_tail) {
+        return;
+    }
+    
+    if (conn->prev) {
+        conn->prev->next = conn->next;
+    } else {
+        active_connections = conn->next;
+    }
+    
+    if (conn->next) {
+        conn->next->prev = conn->prev;
+    }
+    
+    conn->next = NULL;
+    conn->prev = active_connections_tail;
+    
+    if (active_connections_tail) {
+        active_connections_tail->next = conn;
+    } else {
+        active_connections = conn;
+    }
+    
+    active_connections_tail = conn;
 }
 
 connection_t *pool_alloc_connection(void) {
@@ -222,8 +261,7 @@ void destroy_connection(connection_t *conn, int epoll_fd) {
 int parse_and_prepare_response(connection_t *conn) {
     
     if (sscanf(conn->request_buffer, "%15s %255s", conn->method, conn->uri) != 2) return -1;
-    printf("Request: %s %s\n", conn->method, conn->uri);
-
+    
     if (strcmp(conn->method, "GET") != 0) return -1;
 
     char decoded_uri[256];
@@ -293,6 +331,7 @@ int handle_read_request(connection_t *conn) {
         conn->request_len += n;
         conn->request_buffer[conn->request_len] = '\0';
         conn->last_activity = time(NULL);
+        list_move_to_tail(conn);
 
         if (strstr(conn->request_buffer, "\r\n\r\n") != NULL) return 1;
     }
@@ -309,6 +348,7 @@ int handle_send_header(connection_t *conn) {
 
         conn->header_sent += n;
         conn->last_activity = time(NULL);
+        list_move_to_tail(conn);
     }
     return 1;
 }
@@ -328,12 +368,14 @@ int handle_send_file(connection_t *conn) {
             break;
         }
         conn->last_activity = time(NULL);
+        list_move_to_tail(conn);
     }
     return 1;
 }
 
 void reset_for_next_request(connection_t *conn) {
     conn->last_activity = time(NULL);
+    list_move_to_tail(conn); 
 
     char *end_of_header = strstr(conn->request_buffer, "\r\n\r\n");
     if (!end_of_header) {
@@ -445,96 +487,26 @@ void handle_connection(connection_t *conn, int epoll_fd, uint32_t events) {
     }
 }
 
-int main(void) {
-    int listen_fd;
-    struct addrinfo hints, *servinfo, *p;
-    int yes=1;
-    int rv;
+void run_worker(int listen_fd, int worker_id) {
     time_t last_sweep = 0;
 
-    if (realpath("www", www_root_path) == NULL) {
-        perror("Error resolving 'www' directory. Make sure it exists");
-        return 1;
-    }
-    printf("Web root resolved to: %s\n", www_root_path);
-
-    init_connection_pool();
-    printf("Initialized connection pool with %d connections\n", CONNECTION_POOL_SIZE);
-
-    signal(SIGPIPE, SIG_IGN);
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-
-    if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-        return 1;
-    }
-
-    for(p = servinfo; p != NULL; p = p->ai_next) {
-        if ((listen_fd = socket(p->ai_family, p->ai_socktype,
-                p->ai_protocol)) == -1) {
-            perror("socket");
-            continue;
-        }
-
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes,
-                sizeof(int)) == -1) {
-            perror("setsockopt");
-            close(listen_fd);
-            continue;
-        }
-
-        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, 
-                sizeof(int)) == -1) {
-            perror("setsockopt SO_REUSEPORT");
-        }
-
-        if (set_nonblocking(listen_fd) == -1) {
-            perror("set_nonblocking");
-            close(listen_fd);
-            continue;
-        }
-
-        if (bind(listen_fd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(listen_fd);
-            perror("bind");
-            continue;
-        }
-
-        break;
-    }
-
-    freeaddrinfo(servinfo);
-
-    if (p == NULL)  {
-        fprintf(stderr, "server: failed to bind\n");
-        return 1;
-    }
-
-    if (listen(listen_fd, BACKLOG) == -1) {
-        perror("listen");
-        return 1;
-    }
+    printf("Worker %d (PID %d) starting on port %s...\n", worker_id, getpid(), PORT);
 
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         perror("epoll_create1");
-        return 1;
+        exit(1);
     }
 
     struct epoll_event ev, events[MAX_EVENTS];
-    ev.events = EPOLLIN;
+    
+    ev.events = EPOLLIN | EPOLLEXCLUSIVE;
     ev.data.fd = listen_fd;
 
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev) == -1) {
         perror("epoll_ctl: listen_fd");
-        return 1;
+        exit(1);
     }
-
-    printf("Server listening on port %s...\n", PORT);
 
     while(1) {  
         int n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
@@ -551,22 +523,17 @@ int main(void) {
                     struct sockaddr_storage client_addr;
                     socklen_t addr_len = sizeof(client_addr);
 
-                    int client_fd = accept(listen_fd,
+                    int client_fd = accept4(listen_fd,
                                           (struct sockaddr *)&client_addr,
-                                          &addr_len);
+                                          &addr_len,
+                                          SOCK_NONBLOCK | SOCK_CLOEXEC);
 
                     if (client_fd == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
                         }
-                        perror("accept");
+                        perror("accept4");
                         break;
-                    }
-
-                    if (set_nonblocking(client_fd) == -1) {
-                        perror("set_nonblocking");
-                        close(client_fd);
-                        continue;
                     }
 
                     int flag = 1;
@@ -602,16 +569,122 @@ int main(void) {
             connection_t *curr = active_connections;
             while (curr) {
                 connection_t *next = curr->next;
-                if ((now - curr->last_activity) > CONNECTION_TIMEOUT) {
-                    destroy_connection(curr, epoll_fd);
+                
+                if ((now - curr->last_activity) <= CONNECTION_TIMEOUT) {
+                    break; 
                 }
+                
+                destroy_connection(curr, epoll_fd);
                 curr = next;
             }
             last_sweep = now;
         }
     }
 
-    close(listen_fd);
     close(epoll_fd);
+    exit(0);
+}
+
+int main(void) {
+    int listen_fd;
+    struct addrinfo hints, *servinfo, *p;
+    int yes=1;
+    int rv;
+
+    if (realpath("www", www_root_path) == NULL) {
+        perror("Error resolving 'www' directory. Make sure it exists");
+        return 1;
+    }
+    printf("Web root resolved to: %s\n", www_root_path);
+
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    if ((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return 1;
+    }
+
+    for(p = servinfo; p != NULL; p = p->ai_next) {
+        if ((listen_fd = socket(p->ai_family, p->ai_socktype,
+                p->ai_protocol)) == -1) {
+            perror("socket");
+            continue;
+        }
+
+        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes,
+                sizeof(int)) == -1) {
+            perror("setsockopt");
+            close(listen_fd);
+            continue;
+        }
+
+        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, 
+                sizeof(int)) == -1) {
+            perror("setsockopt SO_REUSEPORT");
+            close(listen_fd);
+            continue;
+        }
+
+        if (set_nonblocking(listen_fd) == -1) {
+            perror("set_nonblocking");
+            close(listen_fd);
+            continue;
+        }
+
+        if (bind(listen_fd, p->ai_addr, p->ai_addrlen) == -1) {
+            close(listen_fd);
+            perror("bind");
+            continue;
+        }
+
+        break;
+    }
+
+    freeaddrinfo(servinfo);
+
+    if (p == NULL)  {
+        fprintf(stderr, "server: failed to bind\n");
+        return 1;
+    }
+
+    if (listen(listen_fd, BACKLOG) == -1) {
+        perror("listen");
+        return 1;
+    }
+
+    int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_workers <= 0) num_workers = 4;
+    
+    printf("Starting %d worker processes...\n", num_workers);
+
+    init_connection_pool();
+    printf("Initialized connection pool with %d connections per worker\n", CONNECTION_POOL_SIZE);
+
+    for (int i = 0; i < num_workers; i++) {
+        pid_t pid = fork();
+        
+        if (pid == -1) {
+            perror("fork");
+            continue;
+        }
+        
+        if (pid == 0) {
+            run_worker(listen_fd, i);
+        }
+    }
+
+    printf("Server started with %d workers on port %s\n", num_workers, PORT);
+    
+    while(1) {
+        wait(NULL);
+    }
+
+    close(listen_fd);
     return 0;
 }
